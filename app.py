@@ -1,320 +1,220 @@
-"""AI(강화학습)가 찾아낸 '물건을 가장 안정적으로 옮기는 움직임' 비교 시뮬레이터
-사다리꼴  vs  S-curve  vs  5차 다항식
-
+"""물 컵을 옮길 때 어떤 움직임이 더 안정적일까?  사다리꼴 vs S-curve vs 5차 다항식
 실행:  pip install -r requirements.txt  →  streamlit run app.py
-(sim_core.py 와 같은 폴더에 두세요)
 """
 import numpy as np
 import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-from sim_core import (DT, G, KINDS, SETTLE, TGRID, TMAX, accel, cumint, evaluate,
-                      grid_best, peak_accel_jerk, train)
-
-st.set_page_config(page_title="AI 물건 운반 시뮬레이터", page_icon="🤖", layout="wide")
-
+# ═════════════════════ 계산 (물리 모델) ═════════════════════
+G = 9.81
+DT = 0.002
+TG = np.arange(0.0, 5.0, DT)          # 시뮬레이션 시간 (최대 5초)
+ZETA = 0.01                            # 물의 출렁임 감쇠비 (작음)
+CUP_H = 0.10                           # 컵 높이 [m]
+KINDS = {"trap": "사다리꼴", "scurve": "S-curve", "quintic": "5차 다항식"}
 COLORS = {"trap": "#E4572E", "scurve": "#2E86AB", "quintic": "#3BB273"}
-ORDER = list(KINDS)
-
-PRESETS = {
-    "물 담긴 컵": dict(fn=2.5, zeta=0.02, mu=0.40, zlim=8.0),
-    "유리잔 (미끄러운 쟁반)": dict(fn=4.0, zeta=0.03, mu=0.12, zlim=4.0),
-    "단단한 부품 (볼트)": dict(fn=6.0, zeta=0.05, mu=0.25, zlim=3.0),
-}
-
-# ───────────────────────── 사이드바 ─────────────────────────
-st.sidebar.header("📦 운반 조건")
-preset = st.sidebar.selectbox("운반할 물체", list(PRESETS))
-P = PRESETS[preset]
-D = st.sidebar.slider("이동 거리 [m]", 0.5, 2.0, 1.0, 0.1)
-fn = st.sidebar.slider("물체 고정부 고유진동수 [Hz]", 1.0, 8.0, P["fn"], 0.1, key=f"fn_{preset}",
-                       help="물체가 그리퍼/쟁반에 얼마나 '말랑하게' 붙어 있는지. 낮을수록 잘 흔들려요.")
-zeta = st.sidebar.slider("감쇠비 ζ", 0.005, 0.2, P["zeta"], 0.005, key=f"ze_{preset}")
-mu = st.sidebar.slider("마찰계수 μ", 0.05, 0.8, P["mu"], 0.01, key=f"mu_{preset}",
-                       help="가속도가 μg 를 넘으면 물체가 미끄러져요.")
-zlim = st.sidebar.slider("허용 흔들림 [mm]", 1.0, 15.0, P["zlim"], 0.5, key=f"zl_{preset}",
-                         help="이보다 많이 흔들리면 불합격(물이 넘침, 유리 파손 등).") / 1000
-lam = st.sidebar.slider("속도 중요도 λ", 0.0, 3.0, 1.0, 0.1,
-                        help="클수록 빨리 옮기는 것을 중요하게 생각해요. 0이면 안정성만 봅니다.")
-st.sidebar.header("🤖 학습 설정")
-iters = st.sidebar.slider("학습 반복 횟수", 30, 120, 70, 10)
-batch = st.sidebar.slider("한 번에 시도하는 움직임 수", 12, 48, 24, 4)
-seed = st.sidebar.number_input("랜덤 시드", 0, 9999, 1)
-
-scen = dict(fn=fn, zeta=zeta, mu=mu)
-sig = (preset, D, fn, zeta, mu, zlim, lam, iters, batch, int(seed))
-
-st.title("🤖 AI가 고른 '가장 안정적인 운반 움직임'")
-st.caption("강화학습(정책경사)으로 사다리꼴 · S-curve · 5차 다항식 각각의 **최적 파라미터**를 학습시키고, "
-           "물건을 옮길 때 어느 쪽이 더 안정적인지 비교합니다.")
 
 
-# ───────────────────────── 헬퍼 ─────────────────────────
-def nominal_metrics(kind, r):
-    m = evaluate(kind, [r["T"]], [r["ta"]], [r["tj"]], D, fn, zeta, mu, lam, zlim, keep=True)
-    amax, jmax = peak_accel_jerk(kind, np.array([r["T"]]), np.array([r["ta"]]), np.array([r["tj"]]), D)
-    return dict(cost=float(m["cost"][0]), peak=float(m["peak"][0]), slip=float(m["slip"][0]),
-                rrms=float(m["rrms"][0]), rmax=float(m["rmax"][0]), ok=bool(m["success"][0]),
-                amax=float(amax[0]), jmax=float(jmax[0]), a=m["a"][0], Z=m["Z"], P=m["P"], SL=m["SL"])
+def accel(kind, T, ta_r, tj_r, D, t):
+    """컵(로봇)의 가속도 a(t).  T는 (N,1), t는 (1,S) 배열."""
+    if kind == "quintic":
+        tau = np.clip(t / T, 0, 1)
+        return np.where(t < T, D / T**2 * (60 * tau - 180 * tau**2 + 120 * tau**3), 0.0)
+    ta = ta_r * T
+    tj = np.maximum(tj_r * ta, 1e-9) if kind == "scurve" else np.full_like(ta, 1e-9)
+    A = D / (T - ta) / (ta - tj)
+
+    def g(s):
+        return A * (np.clip(s / tj, 0, 1) - np.clip((s - (ta - tj)) / tj, 0, 1))
+
+    return g(t) - g(t - (T - ta))
 
 
-def run_training():
-    res = {}
-    bar = st.progress(0.0, text="학습 준비 중…")
-    for n, kind in enumerate(ORDER):
-        def cb(f, n=n, kind=kind):
-            bar.progress((n + f) / (len(ORDER) + 1), text=f"🤖 {KINDS[kind]} 궤적 학습 중… ({int(f * 100)}%)")
-        r = train(kind, D, scen, lam, zlim, iters=iters, batch=batch, seed=int(seed), progress=cb)
-        res[kind] = r
-    bar.progress(len(ORDER) / (len(ORDER) + 1), text="격자 탐색으로 결과 검증 중…")
-    for kind in ORDER:
-        res[kind]["grid"] = grid_best(kind, D, scen, lam, zlim)
-        res[kind]["nom"] = nominal_metrics(kind, res[kind])
-    bar.empty()
-    return res
+def peaks(kind, T, ta_r, tj_r, D):
+    """최대 가속도, 최대 저크 (해석식)"""
+    if kind == "quintic":
+        return 10 / np.sqrt(3) * D / T**2, 60 * D / T**3
+    ta = ta_r * T
+    tj = max(tj_r * ta, 1e-9) if kind == "scurve" else 1e-9
+    A = D / (T - ta) / (ta - tj)
+    return A, (A / tj if kind == "scurve" else np.inf)
+
+
+def slosh_freq(R, h):
+    """원통 컵 물 출렁임 1차 모드 고유진동수 [Hz]"""
+    xi = 1.841
+    return np.sqrt(G * xi / R * np.tanh(xi * h / R)) / (2 * np.pi)
+
+
+def simulate(kind, T, ta_r, tj_r, D, R, h):
+    """T: (N,) 배열. 반환: 벽면 수면 높이 변화 eta (N,S) [m], 기울기 s (N,S) = ω²q/g"""
+    T = np.atleast_1d(np.asarray(T, float))
+    a = accel(kind, T[:, None], ta_r, tj_r, D, TG[None, :])
+    aT = np.ascontiguousarray(a.T)
+    w = 2 * np.pi * slosh_freq(R, h)
+    q = np.zeros(len(T)); qd = np.zeros(len(T))
+    slope = np.empty_like(aT)
+    for i in range(len(TG)):
+        qd += (-aT[i] - w * w * q - 2 * ZETA * w * qd) * DT   # 등가 진자(스프링-질량) 모델
+        q += qd * DT
+        slope[i] = w * w * q / G                              # 수면 기울기
+    slope = slope.T
+    return a, slope, R * slope
 
 
 @st.cache_data(show_spinner=False)
-def fn_sweep(kind, T, ta, tj, D, fn, zeta, mu, lam, zlim):
-    rat = np.linspace(0.5, 1.5, 51)
-    m = evaluate(kind, np.full(51, T), np.full(51, ta), np.full(51, tj), D, fn * rat, zeta, mu, lam, zlim)
-    return rat, m["cost"], m["rmax"]
+def sweep(D, ta_r, tj_r, R, h):
+    Ts = np.round(np.arange(0.6, 3.001, 0.05), 2)
+    out = {}
+    for k in KINDS:
+        _, _, eta = simulate(k, Ts, ta_r, tj_r, D, R, h)
+        out[k] = np.abs(eta).max(axis=1)
+    return Ts, out
 
 
-@st.cache_data(show_spinner=False)
-def random_trials(kind, T, ta, tj, D, fn, zeta, mu, lam, zlim, n, var, seed):
-    rng = np.random.default_rng(seed)      # 모든 궤적이 똑같은 시험 조건을 받도록 시드 고정
-    f = fn * rng.uniform(1 - var, 1 + var, n)
-    z = zeta * rng.uniform(1 - var, 1 + var, n)
-    u = mu * rng.uniform(1 - var, 1 + var, n)
-    m = evaluate(kind, np.full(n, T), np.full(n, ta), np.full(n, tj), D, f, z, u, lam, zlim)
-    return m["cost"], m["success"]
+# ═════════════════════ 화면 ═════════════════════
+st.set_page_config(page_title="물 컵 운반 시뮬레이터", page_icon="🥤", layout="wide")
+st.title("🥤 물 컵을 옮길 때, 어떤 움직임이 더 안정적일까?")
+st.caption("같은 거리를 같은 시간에 옮겨도, **가속도가 변하는 방식(저크)** 에 따라 물이 출렁이는 정도가 달라져요.")
+
+c1, c2, c3 = st.columns(3)
+D = c1.slider("이동 거리 [m]", 0.3, 2.0, 1.0, 0.1)
+T = c2.slider("이동 시간 [초]", 0.6, 3.0, 1.5, 0.1)
+fill = c3.slider("컵에 담긴 물의 양 [%]", 40, 95, 80, 5)
+with st.expander("⚙️ 더 설정하기 (선택)"):
+    d1, d2, d3 = st.columns(3)
+    Rcm = d1.slider("컵 반지름 [cm]", 2.0, 6.0, 4.0, 0.5)
+    ta_r = d2.slider("가속하는 시간 비율 (ta / T)", 0.10, 0.50, 0.30, 0.05,
+                     help="사다리꼴과 S-curve에 적용돼요. 0.5이면 등속 구간 없이 가속→감속만 해요.")
+    tj_r = d3.slider("S-curve 부드러움 (tj / ta)", 0.1, 0.5, 0.3, 0.1,
+                     help="클수록 가속도가 더 천천히 변해요.")
+
+R = Rcm / 100
+h = CUP_H * fill / 100
+free = CUP_H - h                      # 물이 넘치지 않는 여유 높이
+fn = slosh_freq(R, h)
+st.write(f"컵 높이 10 cm, 물 높이 **{h * 100:.1f} cm** → 물이 넘치기까지 여유 **{free * 1000:.0f} mm**,  "
+         f"물의 출렁임 고유진동수 **{fn:.2f} Hz** (한 번 출렁이는 데 {1 / fn:.2f}초)")
+
+ts = np.array([T])
+sim = {k: simulate(k, ts, ta_r, tj_r, D, R, h) for k in KINDS}
+stat = {}
+for k in KINDS:
+    a, slope, eta = sim[k]
+    amax, jmax = peaks(k, T, ta_r, tj_r, D)
+    after = TG > T
+    stat[k] = dict(amax=amax, jmax=jmax, emax=np.abs(eta[0]).max(),
+                   eres=np.abs(eta[0][after]).max(), spill=np.abs(eta[0]).max() > free)
+
+# ── 결과 카드
+st.subheader("결과")
+cols = st.columns(3)
+best = min(KINDS, key=lambda k: stat[k]["emax"])
+for col, k in zip(cols, KINDS):
+    s = stat[k]
+    with col:
+        st.markdown(f"<h4 style='color:{COLORS[k]};margin-bottom:0'>{KINDS[k]}</h4>", unsafe_allow_html=True)
+        st.metric("물이 가장 많이 출렁인 높이", f"{s['emax'] * 1000:.1f} mm",
+                  delta=f"여유 {free * 1000:.0f} mm 중", delta_color="off")
+        st.write(("💦 **넘침!**" if s["spill"] else "✅ 안 넘침") + f"  |  도착 후 출렁임 {s['eres'] * 1000:.1f} mm")
+        jtxt = "∞ (이론상)" if np.isinf(s["jmax"]) else f"{s['jmax']:.1f} m/s³"
+        st.caption(f"최대 가속도 {s['amax']:.2f} m/s²  ·  최대 저크 {jtxt}")
+st.success(f"이 조건에서는 **{KINDS[best]}** 가 물을 가장 적게 출렁이게 했어요.")
+
+# ── 컵 애니메이션
+st.subheader("🎬 컵 속 물 모습")
+st.caption("컵 안에서 본 물 표면이에요 (출렁임이 잘 보이도록 그린 모습). 물이 컵 위로 넘치면 빨간색으로 바뀌어요.")
+tf = np.arange(0, T + 1.5, 0.04)
+idx = np.round(tf / DT).astype(int)
+Wcm, Hcm = R * 100, CUP_H * 100
+centers = {k: i * (2 * Wcm + 4) for i, k in enumerate(KINDS)}
 
 
-def build_animation(res, exag):
-    n = len(ORDER)
-    tf_end = max(res[k]["T"] for k in ORDER) + SETTLE
-    tf = np.arange(0, tf_end, 0.05)
-    tfine = np.arange(0, TMAX + SETTLE, 0.001)
-    data = {}
-    for k in ORDER:
-        r = res[k]
-        af = accel(k, np.float64(r["T"]), np.float64(r["ta"]), np.float64(r["tj"]), D, tfine)
-        x = cumint(cumint(af, tfine), tfine)
-        x = x * D / x[-1]
-        ic = np.minimum(np.round(tf / DT).astype(int), len(TGRID) - 1)
-        iff = np.minimum(np.round(tf / 0.001).astype(int), len(tfine) - 1)
-        nom = r["nom"]
-        data[k] = dict(x=x[iff], off=nom["Z"][0][ic] + nom["P"][0][ic], sl=nom["SL"][0][ic])
-
-    def lane_traces(fi):
-        out = []
-        for i, k in enumerate(ORDER):
-            y = n - 1 - i
-            xt = data[k]["x"][fi]
-            out.append(go.Scatter(x=[xt - 0.09, xt + 0.09], y=[y, y], mode="lines",
-                                  line=dict(color="#555", width=8), showlegend=False))
-            out.append(go.Scatter(x=[xt + exag * data[k]["off"][fi]], y=[y + 0.14], mode="markers",
-                                  marker=dict(size=20, line=dict(color="black", width=1),
-                                              color="red" if data[k]["sl"][fi] else COLORS[k]),
-                                  showlegend=False))
-        return out
-
-    fig = go.Figure(data=lane_traces(0), frames=[
-        go.Frame(data=lane_traces(i), traces=list(range(2 * n)), name=str(i)) for i in range(len(tf))])
-    for i, k in enumerate(ORDER):
-        fig.add_annotation(x=-0.2, y=n - 1 - i + 0.38, xanchor="left", showarrow=False,
-                           text=f"<b>{KINDS[k]}</b> (T={res[k]['T']:.2f}s)", font=dict(color=COLORS[k], size=14))
-    fig.add_vline(x=D, line_dash="dot", line_color="gray", annotation_text="목표")
-    fig.add_vline(x=0, line_dash="dot", line_color="gray")
-    fig.update_layout(
-        height=400, margin=dict(l=10, r=10, t=10, b=10),
-        xaxis=dict(range=[-0.2, D + 0.3], title="위치 [m]"),
-        yaxis=dict(range=[-0.5, n - 0.3], visible=False),
-        updatemenus=[dict(type="buttons", showactive=False, x=0.0, y=-0.25, direction="left", buttons=[
-            dict(label="▶ 재생", method="animate",
-                 args=[None, dict(frame=dict(duration=50, redraw=True), fromcurrent=True,
-                                  transition=dict(duration=0))]),
-            dict(label="⏸ 정지", method="animate",
-                 args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])])],
-        sliders=[dict(x=0.15, len=0.85, y=-0.1, currentvalue=dict(prefix="시간 [s]: "),
-                      steps=[dict(method="animate", label=f"{tf[i]:.1f}",
-                                  args=[[str(i)], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
-                             for i in range(len(tf))])])
-    return fig
+def water_traces(fi):
+    out = []
+    for k in KINDS:
+        sl = sim[k][1][0][idx[fi]]
+        yl, yr = (h - R * sl) * 100, (h + R * sl) * 100        # 왼쪽 벽, 오른쪽 벽의 수면 높이 [cm]
+        x0 = centers[k]
+        over = max(yl, yr) > Hcm
+        out.append(go.Scatter(x=[x0 - Wcm, x0 - Wcm, x0 + Wcm, x0 + Wcm, x0 - Wcm],
+                              y=[0, yl, yr, 0, 0], mode="lines", fill="toself", showlegend=False,
+                              line=dict(color="#d62728" if over else "#1f77b4", width=2),
+                              fillcolor="rgba(214,39,40,0.5)" if over else "rgba(31,119,180,0.5)"))
+    return out
 
 
-res = st.session_state.get("res")
-stale = res is not None and st.session_state.get("sig") != sig
+fig = go.Figure(data=water_traces(0), frames=[
+    go.Frame(data=water_traces(i), traces=[0, 1, 2], name=str(i)) for i in range(len(tf))])
+for k in KINDS:
+    x0 = centers[k]
+    fig.add_trace(go.Scatter(x=[x0 - Wcm, x0 - Wcm, x0 + Wcm, x0 + Wcm], y=[Hcm, 0, 0, Hcm], mode="lines",
+                             line=dict(color="black", width=4), showlegend=False))
+    fig.add_annotation(x=x0, y=Hcm + 2.2, text=f"<b>{KINDS[k]}</b>", showarrow=False,
+                       font=dict(color=COLORS[k], size=16))
+fig.update_layout(
+    height=380, margin=dict(l=10, r=10, t=10, b=10),
+    xaxis=dict(visible=False, scaleanchor="y"), yaxis=dict(visible=False, range=[-1, Hcm + 5]),
+    updatemenus=[dict(type="buttons", showactive=False, x=0.0, y=-0.05, direction="left", buttons=[
+        dict(label="▶ 재생", method="animate",
+             args=[None, dict(frame=dict(duration=40, redraw=True), fromcurrent=True, transition=dict(duration=0))]),
+        dict(label="⏸ 정지", method="animate",
+             args=[[None], dict(frame=dict(duration=0, redraw=False), mode="immediate")])])],
+    sliders=[dict(x=0.15, len=0.85, y=-0.02, currentvalue=dict(prefix="시간 [초]: "),
+                  steps=[dict(method="animate", label=f"{tf[i]:.1f}",
+                              args=[[str(i)], dict(mode="immediate", frame=dict(duration=0, redraw=True))])
+                         for i in range(len(tf))])])
+st.plotly_chart(fig)
 
-tab1, tab2, tab3, tab4 = st.tabs(["🤖 AI 학습", "🎬 운반 시뮬레이션", "🛡️ 안정성 시험", "📖 모델 설명"])
+# ── 시간 그래프
+st.subheader("📈 시간에 따른 변화")
+fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
+                    subplot_titles=("컵의 가속도 [m/s²]", "벽면에서 물 높이의 변화 [mm]  (점선 = 넘치는 높이)"))
+tmask = TG <= T + 1.5
+for k in KINDS:
+    a, _, eta = sim[k]
+    fig.add_trace(go.Scatter(x=TG[tmask], y=a[0][tmask], name=KINDS[k],
+                             line=dict(color=COLORS[k], width=2.5)), row=1, col=1)
+    fig.add_trace(go.Scatter(x=TG[tmask], y=eta[0][tmask] * 1000, name=KINDS[k], showlegend=False,
+                             line=dict(color=COLORS[k], width=2)), row=2, col=1)
+for s in (free * 1000, -free * 1000):
+    fig.add_hline(y=s, row=2, col=1, line_dash="dot", line_color="red")
+fig.add_vline(x=T, line_dash="dash", line_color="gray", annotation_text="도착")
+fig.update_xaxes(title_text="시간 [초]", row=2, col=1)
+fig.update_layout(height=560, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=1.1))
+st.plotly_chart(fig)
+st.caption("사다리꼴은 가속도가 계단처럼 바뀌어서(저크 ∞) 출렁임이 크게 일어나기 쉬워요. "
+           "S-curve와 5차 다항식은 가속도가 부드럽게 바뀌어 출렁임이 덜하지만, 같은 가속 시간이면 S-curve는 "
+           "최대 가속도가 더 커질 수 있어요. 또 가속 시간이 물의 출렁임 주기의 정수배에 맞으면 사다리꼴도 "
+           "도착 후 출렁임이 거의 사라져요. 설정을 바꿔 가며 확인해 보세요!")
 
-# ───────────────────────── 탭 1 : 학습 ─────────────────────────
-with tab1:
-    st.write(f"선택한 물체: **{preset}**  |  이동 거리 {D} m  |  fn {fn} Hz, ζ {zeta}, μ {mu}  |  "
-             f"허용 흔들림 {zlim * 1000:.1f} mm  |  λ {lam}")
-    if st.button("🚀 학습 시작", type="primary"):
-        res = run_training()
-        st.session_state["res"] = res
-        st.session_state["sig"] = sig
-        stale = False
-    if res is None:
-        st.info("왼쪽에서 조건을 고른 뒤 **학습 시작**을 눌러 주세요. (약 10~20초)")
+# ── 얼마나 빨리 옮길 수 있나
+st.subheader("⏱️ 얼마나 빨리 옮길 수 있을까?")
+Ts, mx = sweep(D, ta_r, tj_r, R, h)
+fig = go.Figure()
+for k in KINDS:
+    fig.add_trace(go.Scatter(x=Ts, y=mx[k] * 1000, name=KINDS[k], line=dict(color=COLORS[k], width=2.5)))
+fig.add_hline(y=free * 1000, line_dash="dot", line_color="red", annotation_text="넘치는 높이")
+fig.update_layout(height=360, margin=dict(l=10, r=10, t=10, b=10), xaxis_title="이동 시간 [초]",
+                  yaxis_title="최대 출렁임 높이 [mm]", legend=dict(orientation="h", y=1.1))
+st.plotly_chart(fig)
+cols = st.columns(3)
+for col, k in zip(cols, KINDS):
+    unsafe = np.where(mx[k] > free)[0]
+    if len(unsafe) == 0:
+        txt = f"{Ts[0]:.2f} 초 이상"
+    elif unsafe[-1] == len(Ts) - 1:
+        txt = "3초로도 넘침"
     else:
-        if stale:
-            st.warning("⚠️ 조건이 바뀌었어요. 아래 결과는 이전 조건에서 학습한 것이니 **학습 시작**을 다시 눌러 주세요.")
+        txt = f"{Ts[unsafe[-1] + 1]:.2f} 초 이상"
+    col.metric(f"{KINDS[k]}: 안 넘치게 옮기려면", txt)
+st.caption("곡선이 낮을수록 같은 시간에 물이 덜 출렁이고, 같은 곡선이라도 점선 아래에 있어야 물이 안 넘쳐요. "
+           "이 시뮬레이션은 단순화한 모델이라 실제 컵의 값과는 차이가 있을 수 있어요.")
 
-        fig = go.Figure()
-        for k in ORDER:
-            fig.add_trace(go.Scatter(y=res[k]["hist_eval"], name=KINDS[k], mode="lines",
-                                     line=dict(color=COLORS[k], width=3)))
-            fig.add_hline(y=res[k]["grid"], line_dash="dot", line_color=COLORS[k], opacity=0.6)
-        fig.update_layout(height=360, margin=dict(l=10, r=10, t=30, b=10),
-                          title="AI의 학습 곡선 (낮을수록 좋음, 점선 = 격자탐색으로 구한 최고 점수)",
-                          xaxis_title="학습 반복", yaxis_title="비용 = −보상", legend=dict(orientation="h", y=1.12))
-        st.plotly_chart(fig)
-
-        rows = {k2: [] for k2 in ["궤적", "이동시간 T [s]", "가속시간 ta/T", "저크구간 tj/ta", "최대 가속도 [m/s²]",
-                                  "최대 저크 [m/s³]", "최대 흔들림 [mm]", "미끄러짐 [mm]", "도착 후 잔류진동 [mm]",
-                                  "비용", "합격", "격자탐색 대비"]}
-        for k in ORDER:
-            r, n_ = res[k], res[k]["nom"]
-            rows["궤적"].append(KINDS[k])
-            rows["이동시간 T [s]"].append(f"{r['T']:.2f}")
-            rows["가속시간 ta/T"].append("—" if k == "quintic" else f"{r['ta']:.2f}")
-            rows["저크구간 tj/ta"].append(f"{r['tj']:.2f}" if k == "scurve" else "—")
-            rows["최대 가속도 [m/s²]"].append(f"{n_['amax']:.2f}")
-            rows["최대 저크 [m/s³]"].append("∞ (이론상)" if np.isinf(n_["jmax"]) else f"{n_['jmax']:.1f}")
-            rows["최대 흔들림 [mm]"].append(f"{n_['peak'] * 1000:.2f}")
-            rows["미끄러짐 [mm]"].append(f"{n_['slip'] * 1000:.2f}")
-            rows["도착 후 잔류진동 [mm]"].append(f"{n_['rmax'] * 1000:.2f}")
-            rows["비용"].append(f"{n_['cost']:.3f}")
-            rows["합격"].append("✅" if n_["ok"] else "❌")
-            rows["격자탐색 대비"].append(f"+{(n_['cost'] / r['grid'] - 1) * 100:.1f}%")
-        st.table(rows)
-        best = min(ORDER, key=lambda k: res[k]["nom"]["cost"])
-        st.success(f"학습한 조건에서는 **{KINDS[best]}** 궤적의 비용이 가장 낮았어요. "
-                   "하지만 이건 *이 조건에서의 점수*일 뿐이에요. 조건이 조금 달라져도 안정적인지는 "
-                   "**🛡️ 안정성 시험** 탭에서 확인해 보세요!")
-        st.caption("'격자탐색 대비'는 AI가 찾은 값이 무작정 모든 조합을 다 시험해 본 최고 점수보다 몇 % 나쁜지를 뜻해요. "
-                   "숫자가 작을수록 AI가 최적값에 가깝게 학습한 거예요.")
-
-# ───────────────────────── 탭 2 : 시뮬레이션 ─────────────────────────
-with tab2:
-    if res is None:
-        st.info("먼저 **🤖 AI 학습** 탭에서 학습을 실행해 주세요.")
-    else:
-        if stale:
-            st.warning("⚠️ 이전 조건의 학습 결과를 보여 주고 있어요.")
-        exag = st.slider("물체 움직임 확대 배율", 1, 200, 40,
-                         help="실제 흔들림은 mm 단위라 눈에 안 보여서 확대해서 그려요. 빨간색 = 미끄러지는 중")
-        st.plotly_chart(build_animation(res, exag))
-        st.caption("▶ 재생을 누르면 세 궤적이 동시에 출발해요. 회색 막대 = 쟁반(그리퍼), 동그라미 = 물체.")
-
-        fig = make_subplots(rows=2, cols=1, shared_xaxes=True, vertical_spacing=0.1,
-                            subplot_titles=("쟁반 가속도 a(t) [m/s²]", "쟁반에 대한 물체의 상대 변위 z(t) [mm]"))
-        for k in ORDER:
-            n_ = res[k]["nom"]
-            fig.add_trace(go.Scatter(x=TGRID, y=n_["a"], name=KINDS[k], line=dict(color=COLORS[k], width=2.5)),
-                          row=1, col=1)
-            fig.add_trace(go.Scatter(x=TGRID, y=n_["Z"][0] * 1000, name=KINDS[k], showlegend=False,
-                                     line=dict(color=COLORS[k], width=2)), row=2, col=1)
-        zmax_mm = mu * G / (2 * np.pi * fn) ** 2 * 1000
-        for s in (zmax_mm, -zmax_mm):
-            fig.add_hline(y=s, row=2, col=1, line_dash="dot", line_color="gray")
-        fig.add_annotation(x=TMAX + SETTLE, y=zmax_mm, row=2, col=1, text="미끄러짐 한계", showarrow=False,
-                           xanchor="right", yshift=10)
-        fig.update_xaxes(title_text="시간 t [s]", row=2, col=1)
-        fig.update_layout(height=560, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=1.1))
-        st.plotly_chart(fig)
-        st.caption("가속도가 갑자기 바뀌는(저크가 큰) 궤적일수록, 도착한 뒤에도 z(t)가 오래 떨려요. "
-                   "z(t)가 점선(미끄러짐 한계)에 닿으면 물체가 미끄러져요.")
-
-# ───────────────────────── 탭 3 : 안정성 시험 ─────────────────────────
-with tab3:
-    if res is None:
-        st.info("먼저 **🤖 AI 학습** 탭에서 학습을 실행해 주세요.")
-    else:
-        if stale:
-            st.warning("⚠️ 이전 조건의 학습 결과를 보여 주고 있어요.")
-        st.subheader("① 물체의 고유진동수가 달라지면?")
-        st.write("AI는 *하나의 조건*에서 학습했어요. 실제로는 물체 무게나 잡는 힘이 바뀌어 고유진동수가 달라질 수 있죠. "
-                 "학습한 궤적을 그대로 두고 고유진동수만 50%~150%로 바꿔 볼게요.")
-        fig = make_subplots(rows=1, cols=2, subplot_titles=("도착 후 잔류진동 [mm]", "종합 비용 (낮을수록 좋음)"))
-        for k in ORDER:
-            r = res[k]
-            rat, cost, rmax = fn_sweep(k, r["T"], r["ta"], r["tj"], D, fn, zeta, mu, lam, zlim)
-            fig.add_trace(go.Scatter(x=rat * 100, y=rmax * 1000, name=KINDS[k],
-                                     line=dict(color=COLORS[k], width=2.5)), row=1, col=1)
-            fig.add_trace(go.Scatter(x=rat * 100, y=cost, name=KINDS[k], showlegend=False,
-                                     line=dict(color=COLORS[k], width=2.5)), row=1, col=2)
-        fig.add_vline(x=100, line_dash="dot", line_color="gray")
-        fig.update_xaxes(title_text="학습 때 대비 고유진동수 [%]")
-        fig.update_layout(height=380, margin=dict(l=10, r=10, t=40, b=10), legend=dict(orientation="h", y=1.15))
-        st.plotly_chart(fig)
-        st.caption("학습한 조건(100%)에서만 진동이 0에 가깝게 '맞춰진' 궤적은 조건이 조금만 어긋나도 진동이 커져요 "
-                   "(공진 조건에 딱 맞춘 셈). 곡선이 완만할수록 조건 변화에 강한 궤적이에요.")
-
-        st.subheader("② 무작위 조건 시험")
-        c1, c2 = st.columns(2)
-        n_tr = c1.slider("시험 횟수", 100, 500, 300, 50)
-        var = c2.slider("조건 변동 폭 (±%)", 10, 50, 30, 5) / 100
-        stats = {}
-        for k in ORDER:
-            r = res[k]
-            cost, ok = random_trials(k, r["T"], r["ta"], r["tj"], D, fn, zeta, mu, lam, zlim, n_tr, var, 123)
-            stats[k] = dict(cost=cost, ok=ok)
-        c1, c2 = st.columns(2)
-        fig = go.Figure(go.Bar(x=[KINDS[k] for k in ORDER], y=[stats[k]["ok"].mean() * 100 for k in ORDER],
-                               marker_color=[COLORS[k] for k in ORDER],
-                               text=[f"{stats[k]['ok'].mean() * 100:.0f}%" for k in ORDER], textposition="outside"))
-        fig.update_layout(title="합격률 (미끄러짐·흔들림·잔류진동 기준)", yaxis=dict(range=[0, 110], title="%"),
-                          height=340, margin=dict(l=10, r=10, t=50, b=10))
-        c1.plotly_chart(fig)
-        fig = go.Figure()
-        for k in ORDER:
-            fig.add_trace(go.Box(y=stats[k]["cost"], name=KINDS[k], marker_color=COLORS[k], boxmean=True))
-        fig.update_layout(title="비용 분포 (낮고 좁을수록 안정적)", height=340, showlegend=False,
-                          margin=dict(l=10, r=10, t=50, b=10))
-        c2.plotly_chart(fig)
-
-        rank = sorted(ORDER, key=lambda k: (-stats[k]["ok"].mean(), stats[k]["cost"].mean()))
-        top = rank[0]
-        st.success(
-            f"이 시험에서는 **{KINDS[top]}** 궤적이 합격률 {stats[top]['ok'].mean() * 100:.0f}%, "
-            f"평균 비용 {stats[top]['cost'].mean():.2f}로 가장 안정적이었어요.")
-        st.caption("⚠️ 결과는 물체·조건·시드에 따라 달라져요. 물체를 바꾸거나 변동 폭을 키워서 순위가 바뀌는지 "
-                   "직접 확인해 보세요. 이 시뮬레이션은 단순화한 모델이라 실제 로봇의 측정 결과는 아니에요.")
-
-# ───────────────────────── 탭 4 : 모델 설명 ─────────────────────────
-with tab4:
-    st.subheader("물리 모델")
-    st.markdown("쟁반(그리퍼)이 정해진 궤적으로 움직이고, 그 위의 물체는 **탄성 패드**로 붙어 있다고 단순화했어요. "
-                "z는 쟁반에 대한 물체의 상대 변위예요.")
-    st.latex(r"\ddot z = -a_t(t) - \omega^2 z - 2\zeta\omega\,\dot z,\qquad \omega = 2\pi f_n")
-    st.latex(r"|z| > z_{max} = \frac{\mu g}{\omega^2}\ \Rightarrow\ \text{물체가 미끄러짐 (미끄러진 거리 누적)}")
-    st.markdown("가속도 a_t가 크면 z가 커지고, 저크가 크면(가속도가 갑자기 바뀌면) 도착 후에도 z가 떨려요.")
-
-    st.subheader("강화학습 (REINFORCE, 정책경사)")
-    st.markdown(
-        """
-- **행동(action)** : 궤적 파라미터 — 이동시간 T, 가속시간 비율 ta/T, 저크구간 비율 tj/ta  
-  (사다리꼴 = T, ta / S-curve = T, ta, tj / 5차 다항식 = T)
-- **환경(environment)** : 위의 물체 운반 시뮬레이터. 한 번 옮기는 것이 1 에피소드(1-step)예요.
-- **정책(policy)** : 파라미터 공간의 가우시안 분포. 평균이 'AI가 생각하는 최선', 표준편차가 '탐험 정도'예요.
-- **학습** : 매 반복마다 여러 움직임을 시도 → 보상이 평균보다 높았던 방향으로 정책 평균을 이동 → 탐험 폭을 점점 줄임.
-"""
-    )
-    st.latex(r"\text{비용} = \frac{z_{peak}}{z_{lim}} + 4\,\frac{z_{rms,\ 도착\ 후}}{z_{lim}} + 10\,\frac{\text{미끄러짐}}{z_{lim}} + \lambda T,"
-             r"\qquad \text{보상} = -\text{비용}")
-    st.markdown(
-        """
-- 흔들림, 도착 후 잔류진동, 미끄러짐이 작을수록, 그리고 빠를수록(λ가 클수록 더 중요) 보상이 커요.
-- 세 궤적 모두 **같은 보상, 같은 학습 방법**으로 각자 최선을 찾게 해서 공정하게 비교해요.
-- 격자 탐색(가능한 조합을 모두 시험)으로 구한 최고 점수와 비교해 AI가 제대로 학습했는지 검증해요.
-
-**한계** : 1-step 정책경사(= 컨텍스트 없는 밴딧 문제)라서, 로봇이 매 순간 저크를 직접 고르는 '완전한' 강화학습
-(PPO, DDPG 등)보다는 단순해요. 대신 numpy만으로 몇 초 안에 학습되고, 결과를 해석하기 쉬워요.
-"""
-    )
+with st.expander("📖 어떻게 계산했나요?"):
+    st.markdown("물의 출렁임을 **스프링에 매달린 질량**(등가 진자)처럼 단순화했어요. 컵이 가속도 a(t)로 움직일 때,")
+    st.latex(r"\ddot q = -a(t) - \omega^2 q - 2\zeta\omega\dot q,\qquad \text{벽면 수면 높이 변화} = R\,\frac{\omega^2 q}{g}")
+    st.markdown("- 출렁임 고유진동수 ω는 컵 반지름과 물 높이로 계산한 원통 용기의 1차 슬로싱 모드 값이에요.\n"
+                "- 벽면 수면 높이 변화가 컵의 여유 높이를 넘으면 물이 넘친다고 봤어요.\n"
+                "- 5차 다항식: s = 10τ³ − 15τ⁴ + 6τ⁵, 사다리꼴/S-curve: 가속 시간 ta를 같은 방식으로 맞춰 비교했어요.")
